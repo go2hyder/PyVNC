@@ -1,11 +1,12 @@
 """One remote-screen window per connection."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QStandardPaths, Qt, pyqtSignal
+from PyQt6.QtCore import QMimeData, QObject, QStandardPaths, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QScrollArea, QToolButton,
@@ -39,6 +40,8 @@ class Bridge(QObject):
     closed = pyqtSignal(object)
     security = pyqtSignal(str)
     cert_request = pyqtSignal(object)
+    file_status = pyqtSignal(str)
+    files_received = pyqtSignal(object)
 
     def callbacks(self) -> Callbacks:
         return Callbacks(
@@ -49,6 +52,8 @@ class Bridge(QObject):
             on_bell=self.bell.emit,
             on_closed=self.closed.emit,
             on_security=self.security.emit,
+            on_file_status=self.file_status.emit,
+            on_files=self.files_received.emit,
             confirm_certificate=self._confirm_certificate,
         )
 
@@ -77,6 +82,9 @@ class ViewerWindow(QMainWindow):
         self._user_closed = False
         self._finished = False
         self._last_remote_clipboard: str | None = None
+        self._remote_files: frozenset[str] = frozenset()
+        self._ignore_files_until = 0.0
+        self._transfer_note = ""
         self.client: RFBClient | None = None
         self.bridge: Bridge | None = None
 
@@ -111,6 +119,7 @@ class ViewerWindow(QMainWindow):
             username=self.conn.username or "pyvnc",
             quality_level=QUALITY_PRESETS.get(self.conn.quality, 5),
             allow_insecure=self.conn.allow_insecure,
+            share_clipboard=self.conn.share_clipboard,
         )
         self.bridge = Bridge()
         self.client = RFBClient(options, self.bridge.callbacks())
@@ -124,6 +133,8 @@ class ViewerWindow(QMainWindow):
         b.closed.connect(self._on_closed)
         b.security.connect(self._on_security)
         b.cert_request.connect(self._on_cert_request)
+        b.file_status.connect(self._on_file_status)
+        b.files_received.connect(self._on_remote_files)
         self.client.start()
 
     def _on_connected(self, name: str, fb) -> None:
@@ -155,6 +166,8 @@ class ViewerWindow(QMainWindow):
             parts.append(f"{w} x {h}")
         if self._security:
             parts.append(self._security)
+        if self._transfer_note:
+            parts.append(self._transfer_note)
         self.status.setText("   |   ".join(parts))
 
     def _on_closed(self, error) -> None:
@@ -279,8 +292,46 @@ class ViewerWindow(QMainWindow):
         self._last_remote_clipboard = text
         QGuiApplication.clipboard().setText(text)
 
+    def _on_file_status(self, text: str) -> None:
+        self._transfer_note = text
+        self._update_status()
+
+    def _on_remote_files(self, paths: list[str]) -> None:
+        if not self.conn.share_clipboard or not paths:
+            return
+        self._remote_files = frozenset(os.path.normcase(os.path.abspath(path)) for path in paths)
+        self._ignore_files_until = time.monotonic() + 1.0
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+        QGuiApplication.clipboard().setMimeData(mime)
+
+    def _local_files(self) -> list[str]:
+        mime = QGuiApplication.clipboard().mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        files = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if path and os.path.isfile(path):
+                files.append(path)
+        return files
+
     def _on_local_clipboard(self) -> None:
         if not self.conn.share_clipboard or self.client is None:
+            return
+        files = self._local_files()
+        if files:
+            key = frozenset(os.path.normcase(os.path.abspath(path)) for path in files)
+            if key == self._remote_files and time.monotonic() < self._ignore_files_until:
+                return
+            self._remote_files = frozenset()
+            self.client.send_files(files)
+            return
+        mime = QGuiApplication.clipboard().mimeData()
+        if mime is not None and any(url.isLocalFile() for url in mime.urls()):
+            self._on_file_status("Folders are not copied")
             return
         text = QGuiApplication.clipboard().text()
         if text and text != self._last_remote_clipboard:

@@ -8,14 +8,20 @@ import os
 import socket
 import ssl
 import struct
+import textwrap
 import time
 from concurrent.futures import Executor
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from common import rfb
 from common.security import vnc_auth_response
+from common.transfer import (
+    IncomingFile, pack_file_abort, pack_file_caps, read_file_body, receive_dir, transmit_files,
+)
 from server.capture import ScreenCapture, dirty_rects
 from server.encoder import Encoder, desktop_size_update
 
@@ -41,6 +47,7 @@ class ServerConfig:
     forced_quality: int | None
     view_only: bool
     name: str
+    file_dir: Path | None = None
 
 
 class AuthGuard:
@@ -108,6 +115,16 @@ class Session:
         self.full_update = True
         self.prev_frame: np.ndarray | None = None
         self.frame_size: tuple[int, int] | None = None
+        self.capture_error: str | None = None
+        self._notice_sent = False
+        self._notice_cache: tuple[str, np.ndarray] | None = None
+        self._incoming = IncomingFile(config.file_dir or receive_dir())
+        self._discard_file = False
+        self._file_batch: list[str] = []
+        self._last_file_end = 0.0
+        self._send_reject: str | None = None
+        self._files_announced = False
+        self._pending_files: list[str] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -137,6 +154,8 @@ class Session:
             log.info("%s disconnected (%s)", self.peer, exc.__class__.__name__)
         except ProtocolError as exc:
             log.warning("%s protocol error: %s", self.peer, exc)
+        except Exception:
+            log.exception("%s session failed", self.peer)
         finally:
             for t in tasks:
                 t.cancel()
@@ -145,6 +164,7 @@ class Session:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
+            self._incoming.abort()
             if self.injector is not None:
                 self.injector.release_all()
             self.w.close()
@@ -243,10 +263,15 @@ class Session:
 
     async def _init(self) -> None:
         await self.r.readexactly(1)  # shared flag: multiple viewers are always allowed
-        frame = await self._grab()
+        frame = await self._try_grab()
+        if frame is None:
+            frame = self._notice_frame(self.capture_error or "Screen capture failed")
         h, w = frame.shape[:2]
         self.frame_size = (w, h)
-        await self._send(rfb.pack_server_init(w, h, rfb.NATIVE_PIXEL_FORMAT, self.config.name))
+        name = self.config.name
+        if self.capture_error:
+            name += " (screen capture failed)"
+        await self._send(rfb.pack_server_init(w, h, rfb.NATIVE_PIXEL_FORMAT, name))
 
     # -- client messages ---------------------------------------------------
 
@@ -265,6 +290,9 @@ class Session:
                 (count,) = struct.unpack(">xH", await r.readexactly(3))
                 encodings = list(struct.unpack(f">{count}i", await r.readexactly(4 * count)))
                 self.encoder.configure(encodings=encodings)
+                if self.encoder.supports(rfb.ENC_PYVNC_FILES) and not self._files_announced:
+                    self._files_announced = True
+                    await self._send(pack_file_caps(rfb.MSG_SERVER_FILES))
             elif msg_type == rfb.MSG_FB_UPDATE_REQUEST:
                 incremental, _x, _y, _w, _h = struct.unpack(">BHHHH", await r.readexactly(9))
                 if not incremental:
@@ -285,6 +313,8 @@ class Session:
                 text = (await r.readexactly(length)).decode("latin-1")
                 if self.clipboard is not None and not self.config.view_only:
                     self.clipboard.set(text)
+            elif msg_type == rfb.MSG_CLIENT_FILES:
+                await self._on_client_file()
             else:
                 raise ProtocolError(f"unknown message type {msg_type}")
 
@@ -299,13 +329,44 @@ class Session:
     async def _grab(self) -> np.ndarray:
         return await asyncio.get_running_loop().run_in_executor(self.capture_executor, self.capture.grab)
 
+    async def _try_grab(self) -> np.ndarray | None:
+        """Grab a frame. A capture failure is reported once and does not drop the connection."""
+        try:
+            frame = await self._grab()
+        except Exception as exc:
+            message = _capture_failure_text(exc)
+            if message != self.capture_error:
+                log.exception("%s screen capture failed", self.peer)
+                self.capture_error = message
+                self._notice_sent = False
+            return None
+        if self.capture_error:
+            log.info("%s screen capture recovered", self.peer)
+            self.capture_error = None
+            self._notice_sent = False
+            self.full_update = True
+            self.prev_frame = None
+        return frame
+
+    def _notice_frame(self, message: str) -> np.ndarray:
+        if self._notice_cache and self._notice_cache[0] == message:
+            return self._notice_cache[1]
+        frame = _render_notice(message)
+        self._notice_cache = (message, frame)
+        return frame
+
     async def _update_loop(self) -> None:
         loop = asyncio.get_running_loop()
         interval = 1.0 / self.config.fps
         while True:
             await self.update_requested.wait()
             started = loop.time()
-            frame = await self._grab()
+            frame = await self._try_grab()
+            if frame is None:
+                frame = self._notice_frame(self.capture_error or "Screen capture failed")
+                if self._notice_sent and (frame.shape[1], frame.shape[0]) == self.frame_size:
+                    await asyncio.sleep(max(0.0, interval - (loop.time() - started)))
+                    continue
             h, w = frame.shape[:2]
 
             if (w, h) != self.frame_size:
@@ -328,6 +389,7 @@ class Session:
                 await self._send(data)
                 self.prev_frame = frame
                 self.full_update = False
+                self._notice_sent = self.capture_error is not None
                 self.update_requested.clear()
 
             await asyncio.sleep(max(0.0, interval - (loop.time() - started)))
@@ -337,6 +399,106 @@ class Session:
             return
         while True:
             await asyncio.sleep(0.5)
-            text = self.clipboard.poll()
-            if text:
-                await self._send(rfb.pack_cut_text(rfb.MSG_SERVER_CUT_TEXT, text))
+            item = self.clipboard.poll()
+            if isinstance(item, list):
+                if item:
+                    self._pending_files = item
+            elif item:
+                await self._send(rfb.pack_cut_text(rfb.MSG_SERVER_CUT_TEXT, item))
+            if self._pending_files and self.encoder.supports(rfb.ENC_PYVNC_FILES):
+                paths = self._pending_files
+                self._pending_files = None
+                self._send_reject = None
+                await transmit_files(
+                    self._send, rfb.MSG_SERVER_FILES, paths,
+                    reject=lambda: self._send_reject,
+                    on_status=lambda text: log.info("%s %s", self.peer, text),
+                )
+
+    async def _on_client_file(self) -> None:
+        try:
+            op = (await self.r.readexactly(1))[0]
+            body = await read_file_body(self.r.readexactly, op)
+        except ValueError as exc:
+            raise ProtocolError(str(exc)) from exc
+        if op == rfb.FILE_BEGIN:
+            if time.monotonic() - self._last_file_end > 1.0:
+                self._file_batch = []
+            if self.config.view_only or self.clipboard is None:
+                self._discard_file = True
+                self._incoming.abort()
+                await self._send(pack_file_abort(rfb.MSG_SERVER_FILES, "File paste is disabled"))
+                return
+            error = self._incoming.begin(body["name"], body["size"])
+            if error:
+                self._discard_file = True
+                self._incoming.abort()
+                await self._send(pack_file_abort(rfb.MSG_SERVER_FILES, error))
+                return
+            self._discard_file = False
+            log.info("%s receiving %s", self.peer, body["name"])
+            return
+        if op == rfb.FILE_DATA:
+            if self._discard_file:
+                return
+            error = self._incoming.add(body["data"])
+            if error:
+                self._discard_file = True
+                await self._send(pack_file_abort(rfb.MSG_SERVER_FILES, error))
+            return
+        if op == rfb.FILE_END:
+            if self._discard_file:
+                self._discard_file = False
+                return
+            path = self._incoming.end()
+            if path is None:
+                log.warning("%s file transfer was incomplete", self.peer)
+                return
+            self._last_file_end = time.monotonic()
+            self._file_batch.append(str(path))
+            if self.clipboard is not None:
+                self.clipboard.set_files(list(self._file_batch))
+            log.info("%s received %s", self.peer, path.name)
+            return
+        if op == rfb.FILE_ABORT:
+            if self._incoming.active:
+                self._incoming.abort()
+                self._discard_file = False
+                log.info("%s file transfer cancelled: %s", self.peer, body["reason"])
+            else:
+                self._send_reject = body["reason"] or "File paste was refused"
+            return
+        raise ProtocolError(f"bad file operation {op}")
+
+
+def _capture_failure_text(exc: Exception) -> str:
+    detail = str(exc).strip() or exc.__class__.__name__
+    return (
+        f"{detail}\n\n"
+        "Allow Screen Recording for PyVNC Server in System Settings > "
+        "Privacy & Security, then quit and reopen the app."
+    )
+
+
+def _render_notice(message: str) -> np.ndarray:
+    """A small framebuffer the viewer can show when capture is unavailable."""
+    width, height = 960, 540
+    img = Image.new("RGB", (width, height), (28, 28, 28))
+    draw = ImageDraw.Draw(img)
+    title = ImageFont.load_default(size=28)
+    body = ImageFont.load_default(size=18)
+    draw.text((36, 36), "PyVNC cannot capture the screen", font=title, fill=(255, 96, 96))
+    y = 100
+    for paragraph in message.splitlines():
+        lines = textwrap.wrap(paragraph, width=78) or [""]
+        for line in lines:
+            draw.text((36, y), line, font=body, fill=(230, 230, 230))
+            y += 28
+        y += 8
+    rgb = np.asarray(img)
+    frame = np.empty((height, width, 4), dtype=np.uint8)
+    frame[..., 0] = rgb[..., 2]
+    frame[..., 1] = rgb[..., 1]
+    frame[..., 2] = rgb[..., 0]
+    frame[..., 3] = 255
+    return frame

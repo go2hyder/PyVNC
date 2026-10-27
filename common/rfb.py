@@ -33,12 +33,14 @@ MSG_FB_UPDATE_REQUEST = 3
 MSG_KEY_EVENT = 4
 MSG_POINTER_EVENT = 5
 MSG_CLIENT_CUT_TEXT = 6
+MSG_CLIENT_FILES = 7
 
 # Server -> client message types
 MSG_FB_UPDATE = 0
 MSG_SET_COLOUR_MAP = 1
 MSG_BELL = 2
 MSG_SERVER_CUT_TEXT = 3
+MSG_SERVER_FILES = 4
 
 # Encodings
 ENC_RAW = 0
@@ -53,6 +55,16 @@ ENC_CURSOR = -239
 ENC_JPEG_QUALITY_0 = -32  # -32 .. -23 => quality level 0..9
 ENC_COMPRESS_LEVEL_0 = -256  # -256 .. -247 => compression level 0..9
 ENC_FINE_QUALITY_0 = -512  # TigerVNC: -512 .. -412 => JPEG quality 0..100
+ENC_PYVNC_FILES = -307  # PyVNC file clipboard; ignored by other VNC viewers
+
+# File clipboard ops carried by MSG_CLIENT_FILES / MSG_SERVER_FILES
+FILE_CAPS = 0
+FILE_BEGIN = 1
+FILE_DATA = 2
+FILE_END = 3
+FILE_ABORT = 4
+FILE_CHUNK = 64 * 1024
+FILE_MAX_BYTES = 128 * 1024 * 1024
 
 # Tight compression-control values
 TIGHT_FILL = 0x08

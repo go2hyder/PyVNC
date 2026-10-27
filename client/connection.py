@@ -10,8 +10,10 @@ import io
 import logging
 import struct
 import threading
+import time
 import zlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -19,6 +21,7 @@ from PIL import Image
 
 from common import rfb
 from common.security import KnownHosts, cert_fingerprint, client_tls_context, vnc_auth_response
+from common.transfer import IncomingFile, read_file_body, receive_dir, transmit_files
 
 log = logging.getLogger("pyvnc.client")
 
@@ -39,6 +42,8 @@ class ConnectOptions:
     quality_level: int | None = 6
     compress_level: int = 6
     allow_insecure: bool = False
+    share_clipboard: bool = True
+    file_dir: Path | None = None
 
 
 @dataclass
@@ -53,6 +58,8 @@ class Callbacks:
     # (host_port, fingerprint, previously_known_fingerprint) -> accept?
     confirm_certificate: Callable[[str, str, str | None], bool] = lambda hp, fp, old: False
     on_security: Callable[[str], None] = lambda description: None
+    on_file_status: Callable[[str], None] = lambda text: None
+    on_files: Callable[[list[str]], None] = lambda paths: None
 
 
 class RFBClient:
@@ -69,6 +76,13 @@ class RFBClient:
         self._zlib = zlib.decompressobj()
         self._tight_streams = [zlib.decompressobj() for _ in range(4)]
         self._closing = False
+        self._file_queue: asyncio.Queue[list[str]] | None = None
+        self._incoming = IncomingFile(options.file_dir or receive_dir())
+        self._file_batch: list[str] = []
+        self._last_file_end = 0.0
+        self._discard_file = False
+        self._peer_files = False
+        self._send_reject: str | None = None
 
     # -- thread management -------------------------------------------------
 
@@ -84,7 +98,17 @@ class RFBClient:
         except ConnectError as exc:
             error = str(exc)
         except (asyncio.IncompleteReadError, ConnectionError) as exc:
-            error = None if self._closing else f"Connection lost ({exc.__class__.__name__})"
+            if self._closing:
+                error = None
+            elif not self.name:
+                error = (
+                    "The Mac closed the connection before sending the screen. "
+                    "Screen capture on the server failed, usually because Screen Recording "
+                    "is not allowed. On the Mac, enable PyVNC Server in System Settings > "
+                    "Privacy & Security > Screen Recording, then quit and reopen the app."
+                )
+            else:
+                error = f"Connection lost ({exc.__class__.__name__})"
         except OSError as exc:
             error = None if self._closing else f"Network error: {exc}"
         except Exception as exc:  # report anything unexpected to the user
@@ -123,6 +147,15 @@ class RFBClient:
     def send_clipboard(self, text: str) -> None:
         self._send_threadsafe(rfb.pack_cut_text(rfb.MSG_CLIENT_CUT_TEXT, text))
 
+    def send_files(self, paths: list[str]) -> None:
+        loop, queue = self._loop, self._file_queue
+        if not self.opts.share_clipboard or loop is None or queue is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, list(paths))
+        except RuntimeError:
+            pass
+
     # -- protocol ----------------------------------------------------------
 
     async def _read(self, n: int) -> bytes:
@@ -144,8 +177,18 @@ class RFBClient:
         await self._handshake()
         await self._client_init()
         self.cb.on_connected(self.name, self.fb)
-        await self._send(self._set_pixel_format() + self._set_encodings() + self._update_request(False))
-        await self._message_loop()
+        self._file_queue = asyncio.Queue()
+        sender = asyncio.create_task(self._file_pump())
+        try:
+            await self._send(self._set_pixel_format() + self._set_encodings() + self._update_request(False))
+            await self._message_loop()
+        finally:
+            sender.cancel()
+            self._incoming.abort()
+            try:
+                await sender
+            except asyncio.CancelledError:
+                pass
 
     async def _handshake(self) -> None:
         version = await self._read(12)
@@ -274,6 +317,8 @@ class RFBClient:
         encs = [rfb.ENC_TIGHT, rfb.ENC_ZLIB, rfb.ENC_COPYRECT, rfb.ENC_RAW,
                 rfb.ENC_DESKTOP_SIZE, rfb.ENC_LAST_RECT,
                 rfb.ENC_COMPRESS_LEVEL_0 + self.opts.compress_level]
+        if self.opts.share_clipboard:
+            encs.append(rfb.ENC_PYVNC_FILES)
         if self.opts.quality_level is not None:
             encs.append(rfb.ENC_JPEG_QUALITY_0 + self.opts.quality_level)
         return struct.pack(f">BxH{len(encs)}i", rfb.MSG_SET_ENCODINGS, len(encs), *encs)
@@ -296,8 +341,90 @@ class RFBClient:
             elif msg_type == rfb.MSG_SERVER_CUT_TEXT:
                 (length,) = struct.unpack(">3xI", await self._read(7))
                 self.cb.on_clipboard((await self._read(length)).decode("latin-1"))
+            elif msg_type == rfb.MSG_SERVER_FILES:
+                await self._on_server_file()
             else:
                 raise ConnectError(f"Unknown server message {msg_type}")
+
+    async def _file_pump(self) -> None:
+        assert self._file_queue is not None
+        while True:
+            paths = await self._file_queue.get()
+            try:
+                for _ in range(20):
+                    if self._peer_files:
+                        break
+                    await asyncio.sleep(0.1)
+                if not self._peer_files:
+                    self.cb.on_file_status("Update PyVNC Server on the Mac to copy files")
+                    continue
+                self._send_reject = None
+                await transmit_files(
+                    self._send, rfb.MSG_CLIENT_FILES, paths,
+                    reject=lambda: self._send_reject,
+                    on_status=self.cb.on_file_status,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("file send failed")
+                self.cb.on_file_status("Could not send the files")
+
+    async def _on_server_file(self) -> None:
+        if not self.opts.share_clipboard:
+            raise ConnectError("Server sent a file while clipboard sharing is off")
+        try:
+            op = (await self._read(1))[0]
+            body = await read_file_body(self._read, op)
+        except ValueError as exc:
+            raise ConnectError(str(exc)) from exc
+        if op == rfb.FILE_CAPS:
+            self._peer_files = True
+            return
+        if op == rfb.FILE_BEGIN:
+            if time.monotonic() - self._last_file_end > 1.0:
+                self._file_batch = []
+            error = self._incoming.begin(body["name"], body["size"])
+            self._discard_file = error is not None
+            if error:
+                self.cb.on_file_status(error)
+            else:
+                self.cb.on_file_status(f"Receiving {body['name']}")
+            return
+        if op == rfb.FILE_DATA:
+            if self._discard_file:
+                return
+            error = self._incoming.add(body["data"])
+            if error:
+                self._discard_file = True
+                self.cb.on_file_status(error)
+            return
+        if op == rfb.FILE_END:
+            if self._discard_file:
+                self._discard_file = False
+                return
+            path = self._incoming.end()
+            if path is None:
+                self.cb.on_file_status("File transfer was incomplete")
+                return
+            self._last_file_end = time.monotonic()
+            self._file_batch.append(str(path))
+            self.cb.on_files(list(self._file_batch))
+            if len(self._file_batch) == 1:
+                self.cb.on_file_status(f"Received {path.name} — paste to place it")
+            else:
+                self.cb.on_file_status(
+                    f"Received {len(self._file_batch)} files — paste to place them")
+            return
+        if op == rfb.FILE_ABORT:
+            if self._incoming.active:
+                self._incoming.abort()
+                self._discard_file = False
+                self.cb.on_file_status(body["reason"] or "File transfer cancelled")
+            else:
+                self._send_reject = body["reason"] or "File paste was refused"
+            return
+        raise ConnectError(f"Bad file operation {op}")
 
     # -- decoding ----------------------------------------------------------
 
