@@ -390,11 +390,12 @@ class RFBClient:
         if op == rfb.FILE_BEGIN:
             if time.monotonic() - self._last_file_end > 1.0:
                 self._file_batch = []
+                self._incoming.reset_batch()
             error = self._incoming.begin(body["name"], body["size"])
             self._discard_file = error is not None
             if error:
                 self.cb.on_file_status(error)
-            else:
+            elif not str(body["name"]).endswith("/"):
                 self._receive_label = body["name"]
                 self._report_progress("receive", self._receive_label, 0, body["size"])
             return
@@ -418,10 +419,12 @@ class RFBClient:
                 self.cb.on_file_status("File transfer was incomplete")
                 return
             self._last_file_end = time.monotonic()
-            self._file_batch.append(str(path))
+            target = self._incoming.clipboard_target or path
+            if str(target) not in self._file_batch:
+                self._file_batch.append(str(target))
             self.cb.on_files(list(self._file_batch))
             if len(self._file_batch) == 1:
-                self.cb.on_file_status(f"Received {path.name} — paste to place it")
+                self.cb.on_file_status(f"Received {target.name} — paste to place it")
             else:
                 self.cb.on_file_status(
                     f"Received {len(self._file_batch)} files — paste to place them")

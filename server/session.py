@@ -424,6 +424,7 @@ class Session:
         if op == rfb.FILE_BEGIN:
             if time.monotonic() - self._last_file_end > 1.0:
                 self._file_batch = []
+                self._incoming.reset_batch()
             if self.config.view_only or self.clipboard is None:
                 self._discard_file = True
                 self._incoming.abort()
@@ -455,10 +456,12 @@ class Session:
                 log.warning("%s file transfer was incomplete", self.peer)
                 return
             self._last_file_end = time.monotonic()
-            self._file_batch.append(str(path))
+            target = self._incoming.clipboard_target or path
+            if str(target) not in self._file_batch:
+                self._file_batch.append(str(target))
             if self.clipboard is not None:
                 self.clipboard.set_files(list(self._file_batch))
-            log.info("%s received %s", self.peer, path.name)
+            log.info("%s received %s", self.peer, target.name)
             return
         if op == rfb.FILE_ABORT:
             if self._incoming.active:

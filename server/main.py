@@ -1,4 +1,4 @@
-"""PyVNC server for macOS, command-line version (the menu bar app is server/app.py).
+"""PyVNC server command-line version (the tray app is server/app.py).
 
 Run from the project root:  python -m server.main --help
 """
@@ -20,7 +20,7 @@ PRIVACY_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_{
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PyVNC server for macOS (RFB 3.8 over TLS)")
+    p = argparse.ArgumentParser(description="PyVNC server (RFB 3.8 over TLS)")
     p.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all interfaces)")
     p.add_argument("--port", type=int, default=5900)
     p.add_argument("--password", help="password (default: $PYVNC_PASSWORD, otherwise prompt)")
@@ -33,7 +33,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--swap-ctrl-cmd", action="store_true",
                    help="treat the viewer's Ctrl as Command and Win/Super as Control")
     p.add_argument("--no-clipboard", action="store_true", help="disable clipboard sync")
-    p.add_argument("--no-caffeinate", action="store_true", help="allow the Mac to sleep while serving")
+    p.add_argument("--no-caffeinate", action="store_true", help="allow the computer to sleep while serving")
     p.add_argument("--insecure-allow-plain", action="store_true",
                    help="also offer unencrypted VNC auth (only for LAN testing with old viewers)")
     p.add_argument("--cert-dir", type=Path, help="where server-cert.pem / server-key.pem live")
@@ -73,8 +73,8 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    if sys.platform != "darwin":
-        sys.exit("The PyVNC server only runs on macOS")
+    if sys.platform not in ("darwin", "win32"):
+        sys.exit("The PyVNC server runs on macOS and Windows")
     settings = ServerSettings(
         password=get_password(args),
         host=args.host,
@@ -90,7 +90,8 @@ def main(argv=None) -> None:
         allow_insecure=args.insecure_allow_plain,
         cert_dir=args.cert_dir,
     )
-    check_permissions(args.view_only)
+    if sys.platform == "darwin":
+        check_permissions(args.view_only)
 
     controller = ServerController()
     try:

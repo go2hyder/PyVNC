@@ -1,0 +1,8 @@
+mss>=10.0
+pycryptodome>=3.20
+cryptography>=42.0
+Pillow>=10.0
+numpy>=1.26
+keyring>=24
+PyQt6>=6.5
+pyinstaller>=6.0

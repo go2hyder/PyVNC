@@ -1,5 +1,6 @@
-"""PyVNC Server menu bar app for macOS.
+"""PyVNC Server tray app.
 
+On macOS it lives in the menu bar. On Windows it lives in the system tray.
 Run from the project root:  python -m server.app   (add --background to start without the window)
 """
 from __future__ import annotations
@@ -19,12 +20,13 @@ import mss
 
 from server import app_support as support
 from server.controller import ControllerEvents, ServerController, ServerSettings
-from server.input_mac import accessibility_trusted, screen_recording_allowed
 
+IS_WINDOWS = sys.platform == "win32"
 APP_NAME = "PyVNC Server"
 INSTANCE_KEY = "pyvnc-server-app"
+_THIS_MACHINE = "This PC only (testing)" if IS_WINDOWS else "This Mac only (testing)"
 LISTEN_CHOICES = [("All interfaces (LAN + internet)", "all"), ("Tailscale only", "tailscale"),
-                  ("This Mac only (testing)", "local")]
+                  (_THIS_MACHINE, "local")]
 SCALE_CHOICES = [("100% (sharpest)", 1.0), ("75%", 0.75), ("50% (fastest)", 0.5)]
 
 
@@ -52,7 +54,8 @@ def tray_icon(running: bool, clients: int) -> QIcon:
             p.drawEllipse(int(12 * s), 0, int(6 * s), int(6 * s))
         p.end()
         icon.addPixmap(pm)
-    icon.setIsMask(True)
+    if not IS_WINDOWS:
+        icon.setIsMask(True)
     return icon
 
 
@@ -100,7 +103,7 @@ def resolve_host(listen: str) -> str:
     if listen == "tailscale":
         ip = support.tailscale_ip()
         if not ip:
-            raise RuntimeError("Tailscale is not connected on this Mac. Start Tailscale or choose "
+            raise RuntimeError("Tailscale is not connected on this computer. Start Tailscale or choose "
                                "'All interfaces'.")
         return ip
     return "0.0.0.0"
@@ -217,7 +220,8 @@ class SettingsWindow(QWidget):
         form.addRow("Port", self.port)
         form.addRow("Listen on", self.listen)
         form.addRow("Password", pw_row)
-        form.addRow(QLabel("The password is stored in your macOS Keychain."))
+        stored = "Windows Credential Manager" if IS_WINDOWS else "your macOS Keychain"
+        form.addRow(QLabel(f"The password is stored in {stored}."))
         form.addRow(self.start_on_launch)
         form.addRow(self.open_at_login)
         form.addRow(self.allow_insecure)
@@ -248,13 +252,17 @@ class SettingsWindow(QWidget):
         self.view_only = QCheckBox("View only (ignore the viewer's mouse and keyboard)")
         self.swap_ctrl_cmd = QCheckBox("Treat the viewer's Ctrl as Command (for third-party viewers)")
         self.clipboard = QCheckBox("Share clipboard")
-        self.keep_awake = QCheckBox("Keep the Mac awake while the server runs")
+        awake = "Keep this PC awake while the server runs" if IS_WINDOWS else "Keep the Mac awake while the server runs"
+        self.keep_awake = QCheckBox(awake)
 
         form.addRow("Display", self.display)
         form.addRow("Resolution", self.scale)
         form.addRow("Max frame rate", fps_row)
         form.addRow("JPEG quality", self.quality)
-        for box in (self.view_only, self.swap_ctrl_cmd, self.clipboard, self.keep_awake):
+        boxes = [self.view_only, self.clipboard, self.keep_awake]
+        if not IS_WINDOWS:
+            boxes.insert(1, self.swap_ctrl_cmd)
+        for box in boxes:
             form.addRow(box)
         return w
 
@@ -262,7 +270,8 @@ class SettingsWindow(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        v.addWidget(QLabel("<b>Connect to this Mac at</b>"))
+        heading = "Connect to this PC at" if IS_WINDOWS else "Connect to this Mac at"
+        v.addWidget(QLabel(f"<b>{heading}</b>"))
         self.addresses = QLabel()
         self.addresses.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(self.addresses)
@@ -359,8 +368,9 @@ class SettingsWindow(QWidget):
             kind = "Tailscale" if support.is_tailscale(ip) else f"LAN ({iface})"
             lines.append(f"{ip} : {port}    <span style='color:gray'>{kind}</span>")
         if not any(support.is_tailscale(ip) for _i, ip in support.local_addresses()):
-            lines.append("<span style='color:gray'>For internet access, install Tailscale on this Mac "
-                         "and the PC.</span>")
+            where = "both PCs" if IS_WINDOWS else "this Mac and the PC"
+            lines.append("<span style='color:gray'>For internet access, install Tailscale on "
+                         f"{where}.</span>")
         self.addresses.setText("<br>".join(lines) or "No network connection")
 
     def set_clients(self, peers: list[str]) -> None:
@@ -371,6 +381,10 @@ class SettingsWindow(QWidget):
         self.log.appendPlainText(line)
 
     def refresh_permissions(self) -> None:
+        if IS_WINDOWS:
+            self.banner.setVisible(False)
+            return
+        from server.input_mac import accessibility_trusted, screen_recording_allowed
         screen_ok = screen_recording_allowed()
         access_ok = accessibility_trusted()
         problems = []
@@ -395,6 +409,7 @@ class SettingsWindow(QWidget):
         self.password.setEchoMode(QLineEdit.EchoMode.Normal)
 
     def _fix_screen_recording(self) -> None:
+        from server.input_mac import screen_recording_allowed
         screen_recording_allowed(request=True)
         support.open_privacy_settings("ScreenCapture")
 

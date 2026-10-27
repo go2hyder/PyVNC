@@ -345,7 +345,7 @@ class ViewerWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             path = url.toLocalFile()
-            if path and os.path.isfile(path):
+            if path and (os.path.isfile(path) or os.path.isdir(path)):
                 files.append(path)
         return files
 
@@ -359,10 +359,6 @@ class ViewerWindow(QMainWindow):
                 return
             self._remote_files = frozenset()
             self.client.send_files(files)
-            return
-        mime = QGuiApplication.clipboard().mimeData()
-        if mime is not None and any(url.isLocalFile() for url in mime.urls()):
-            self._on_file_status("Folders are not copied")
             return
         text = QGuiApplication.clipboard().text()
         if text and text != self._last_remote_clipboard:

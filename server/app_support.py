@@ -1,6 +1,7 @@
 """Helpers for the menu bar app: network addresses, Keychain password, open-at-login."""
 from __future__ import annotations
 
+import ctypes
 import ipaddress
 import plistlib
 import re
@@ -23,6 +24,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def local_addresses() -> list[tuple[str, str]]:
     """Return (interface, IPv4) pairs for active non-loopback interfaces."""
+    if sys.platform == "win32":
+        return _windows_addresses()
     try:
         out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
@@ -106,11 +109,33 @@ def _login_program() -> tuple[list[str], str | None]:
     return [sys.executable, "-m", "server.app", "--background"], str(PROJECT_ROOT)
 
 
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_WIN_RUN_NAME = "PyVNC Server"
+
+
+def _windows_login_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --background'
+    root = str(PROJECT_ROOT)
+    return f'cmd /c cd /d "{root}" && "{sys.executable}" -m server.app --background'
+
+
 def is_open_at_login() -> bool:
+    if sys.platform == "win32":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+                winreg.QueryValueEx(key, _WIN_RUN_NAME)
+            return True
+        except OSError:
+            return False
     return LOGIN_AGENT_PATH.exists()
 
 
 def set_open_at_login(enabled: bool) -> None:
+    if sys.platform == "win32":
+        _set_windows_login(enabled)
+        return
     if not enabled:
         LOGIN_AGENT_PATH.unlink(missing_ok=True)
         return
@@ -125,6 +150,88 @@ def set_open_at_login(enabled: bool) -> None:
 
 
 # -- macOS app behaviour -----------------------------------------------------
+
+def _set_windows_login(enabled: bool) -> None:
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, _WIN_RUN_NAME, 0, winreg.REG_SZ, _windows_login_command())
+        else:
+            try:
+                winreg.DeleteValue(key, _WIN_RUN_NAME)
+            except OSError:
+                pass
+
+
+def _windows_addresses() -> list[tuple[str, str]]:
+    """IPv4 addresses from GetAdaptersAddresses. Skips loopback."""
+    class _SockAddr(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_ushort), ("data", ctypes.c_ubyte * 14)]
+
+    class _SocketAddress(ctypes.Structure):
+        _fields_ = [("addr", ctypes.POINTER(_SockAddr)), ("length", ctypes.c_int)]
+
+    class _Unicast(ctypes.Structure):
+        pass
+
+    _Unicast._fields_ = [
+        ("length", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("next", ctypes.POINTER(_Unicast)),
+        ("address", _SocketAddress),
+    ]
+
+    class _Adapter(ctypes.Structure):
+        pass
+
+    _Adapter._fields_ = [
+        ("length", ctypes.c_ulong),
+        ("index", ctypes.c_ulong),
+        ("next", ctypes.POINTER(_Adapter)),
+        ("name", ctypes.c_char_p),
+        ("unicast", ctypes.POINTER(_Unicast)),
+        ("anycast", ctypes.c_void_p),
+        ("multicast", ctypes.c_void_p),
+        ("dns", ctypes.c_void_p),
+        ("suffix", ctypes.c_wchar_p),
+        ("description", ctypes.c_wchar_p),
+        ("friendly", ctypes.c_wchar_p),
+    ]
+
+    iphlpapi = ctypes.windll.iphlpapi
+    iphlpapi.GetAdaptersAddresses.argtypes = [
+        ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    iphlpapi.GetAdaptersAddresses.restype = ctypes.c_ulong
+    size = ctypes.c_ulong(16 * 1024)
+    for _ in range(2):
+        buf = ctypes.create_string_buffer(size.value)
+        # AF_INET, skip anycast, multicast, and DNS server addresses.
+        err = iphlpapi.GetAdaptersAddresses(
+            2, 0x0002 | 0x0004 | 0x0008, None, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(size))
+        if err == 0:
+            break
+        if err != 111:  # ERROR_BUFFER_OVERFLOW
+            return []
+    else:
+        return []
+
+    found: list[tuple[str, str]] = []
+    adapter = ctypes.cast(buf, ctypes.POINTER(_Adapter))
+    while adapter:
+        item = adapter.contents
+        label = item.friendly or item.description or "Ethernet"
+        node = item.unicast
+        while node:
+            addr = node.contents.address
+            if addr.addr and addr.addr.contents.family == 2:
+                raw = bytes(addr.addr.contents.data[2:6])
+                ip = ".".join(str(b) for b in raw)
+                if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ip != "0.0.0.0":
+                    found.append((label, ip))
+            node = node.contents.next
+        adapter = item.next
+    return found
+
 
 def hide_dock_icon() -> None:
     try:

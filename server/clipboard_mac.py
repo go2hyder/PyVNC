@@ -14,7 +14,7 @@ class Clipboard:
     def poll(self) -> str | list[str] | None:
         """Return new clipboard text, a list of copied file paths, or None if unchanged.
 
-        Files win over text when both are present. Directories are skipped.
+        Files win over text when both are present. A copied folder is included.
         """
         count = self._pb.changeCount()
         if count == self._count:
@@ -56,13 +56,13 @@ class Clipboard:
             if url is None or not url.isFileURL():
                 continue
             path = str(url.path())
-            if os.path.isfile(path):
+            if os.path.isfile(path) or os.path.isdir(path):
                 paths.append(path)
         if paths:
             return paths
         names = self._pb.propertyListForType_("NSFilenamesPboardType") or []
         for name in names:
             path = str(name)
-            if os.path.isfile(path):
+            if os.path.isfile(path) or os.path.isdir(path):
                 paths.append(path)
         return paths

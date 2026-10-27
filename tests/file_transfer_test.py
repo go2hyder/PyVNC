@@ -13,7 +13,7 @@ import numpy as np
 from client.connection import Callbacks, ConnectOptions, RFBClient
 from common import rfb
 from common.security import ensure_server_certificate, server_tls_context
-from common.transfer import IncomingFile, safe_name
+from common.transfer import IncomingFile, safe_name, safe_relative
 from server.session import AuthGuard, ServerConfig, Session
 
 PASSWORD = "smoke-test-password"
@@ -23,6 +23,9 @@ def check_names() -> None:
     assert safe_name(r"..\..\evil.txt") == "evil.txt"
     assert safe_name("../etc/passwd") == "passwd"
     assert safe_name("..") == "file"
+    assert safe_relative(r"..\..\evil.txt") == "evil.txt"
+    assert safe_relative("Album/../../outside.txt") == "Album/outside.txt"
+    assert safe_relative("Album/empty/") == "Album/empty/"
     assert ":" not in safe_name("a:b")
     folder = Path(tempfile.mkdtemp())
     incoming = IncomingFile(folder)
@@ -39,6 +42,26 @@ def check_names() -> None:
     second = incoming.end()
     assert second is not None and second.name == "note (2).txt"
     assert incoming.begin("big", rfb.FILE_MAX_BYTES + 1)
+    assert incoming.begin("Album/nested/song.txt", 4) is None
+    assert incoming.add(b"song") is None
+    saved = incoming.end()
+    assert saved == folder / "Album" / "nested" / "song.txt"
+    assert saved is not None and saved.read_bytes() == b"song"
+    assert incoming.clipboard_target == folder / "Album"
+    assert incoming.begin("Album/empty/", 0) is None
+    empty = incoming.end()
+    assert empty == folder / "Album" / "empty" and empty.is_dir()
+    outside = folder.parent / "escaped.txt"
+    assert incoming.begin("../../escaped.txt", 4) is None
+    incoming.add(b"nope")
+    escaped = incoming.end()
+    assert escaped is not None and escaped.parent == folder and not outside.exists()
+    incoming.reset_batch()
+    assert incoming.begin("Album/b.txt", 1) is None
+    incoming.add(b"c")
+    renamed = incoming.end()
+    assert renamed == folder / "Album (2)" / "b.txt"
+    assert incoming.clipboard_target == folder / "Album (2)"
     print("  names ok")
 
 
@@ -170,7 +193,7 @@ def check_transfer() -> None:
         assert received.read_bytes() == b"hello from mac"
 
         result["got_files"].clear()
-        client.send_files([str(one), str(two), str(source)])
+        client.send_files([str(one), str(two)])
         deadline = time.time() + 10
         while time.time() < deadline and (not clipboard.files or len(clipboard.files[-1]) < 2):
             time.sleep(0.05)
@@ -181,8 +204,48 @@ def check_transfer() -> None:
         by_name = {path.name: path.read_bytes() for path in saved}
         assert by_name["one.txt"] == b"alpha"
         assert by_name["two.txt"] == "beta \u2603".encode()
-        assert not any(path.is_dir() and path.name == source.name for path in mac_dir.iterdir())
         print("  transfer ok", result.get("status"))
+    finally:
+        client.close()
+        stop.set()
+        thread.join(5)
+
+
+def check_folder() -> None:
+    source = Path(tempfile.mkdtemp())
+    folder = source / "Photos"
+    (folder / "trip").mkdir(parents=True)
+    (folder / "trip" / "shot.txt").write_bytes(b"pic")
+    (folder / "empty").mkdir()
+    mac_dir = Path(tempfile.mkdtemp())
+    (mac_dir / "Photos").mkdir()
+    clipboard = FakeClipboard()
+    stop = threading.Event()
+    port_holder: list[int] = []
+    thread = threading.Thread(target=serve, args=(stop, port_holder, clipboard, mac_dir), daemon=True)
+    thread.start()
+    for _ in range(50):
+        if port_holder:
+            break
+        time.sleep(0.05)
+    assert port_holder, "server did not start"
+    result: dict = {"got_files": threading.Event()}
+    client, got = connect(port_holder[0], Path(tempfile.mkdtemp()), result)
+    try:
+        assert got.wait(10), f"no picture: {result}"
+        client.send_files([str(folder)])
+        copied = mac_dir / "Photos (2)"
+        shot = copied / "trip" / "shot.txt"
+        deadline = time.time() + 10
+        while time.time() < deadline and not shot.is_file():
+            time.sleep(0.05)
+        assert shot.is_file() and shot.read_bytes() == b"pic", list(mac_dir.rglob("*"))
+        assert (copied / "empty").is_dir()
+        assert clipboard.files and clipboard.files[-1] == [str(copied)], clipboard.files
+        assert list((mac_dir / "Photos").iterdir()) == []
+        outside = mac_dir.parent / "escaped.txt"
+        assert not outside.exists()
+        print("  folder ok", result.get("status"))
     finally:
         client.close()
         stop.set()
@@ -225,5 +288,6 @@ def check_view_only() -> None:
 if __name__ == "__main__":
     check_names()
     check_transfer()
+    check_folder()
     check_view_only()
     print("file transfer ok")

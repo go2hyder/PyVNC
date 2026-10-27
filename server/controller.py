@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -188,12 +190,8 @@ class ServerController(SessionEvents):
                 name=f"PyVNC on {socket.gethostname()}",
             )
             capture = ScreenCapture(s.display, s.scale)
-            from server.input_mac import InputInjector
-            injector = InputInjector(swap_ctrl_cmd=s.swap_ctrl_cmd)
-            clipboard = None
-            if s.clipboard:
-                from server.clipboard_mac import Clipboard
-                clipboard = Clipboard()
+            injector = _make_injector(s)
+            clipboard = _make_clipboard() if s.clipboard else None
             capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture")
             guard = AuthGuard()
 
@@ -210,7 +208,10 @@ class ServerController(SessionEvents):
 
             server = await asyncio.start_server(on_client, s.host, s.port)
         except OSError as exc:
-            if exc.errno == 48:
+            in_use = exc.errno in (48, 10048) or getattr(exc, "winerror", None) == 10048
+            if in_use and sys.platform == "win32":
+                result["error"] = f"Port {s.port} is already in use. Choose another port."
+            elif in_use:
                 result["error"] = (f"Port {s.port} is already in use. If macOS Screen Sharing is on, "
                                    "it owns 5900: turn it off or choose another port.")
             else:
@@ -254,10 +255,36 @@ class ServerController(SessionEvents):
         log.info("Server stopped")
 
     def _start_caffeinate(self) -> None:
+        if sys.platform == "win32":
+            # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002)
+            self._awake = True
+            return
         if shutil.which("caffeinate"):
             self._caffeinate = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(os.getpid())])
 
     def _stop_caffeinate(self) -> None:
+        if sys.platform == "win32":
+            if getattr(self, "_awake", False):
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+                self._awake = False
+            return
         if self._caffeinate is not None:
             self._caffeinate.terminate()
             self._caffeinate = None
+
+
+def _make_injector(settings: ServerSettings):
+    if sys.platform == "win32":
+        from server.input_win import InputInjector
+        return InputInjector(swap_ctrl_cmd=settings.swap_ctrl_cmd)
+    from server.input_mac import InputInjector
+    return InputInjector(swap_ctrl_cmd=settings.swap_ctrl_cmd)
+
+
+def _make_clipboard():
+    if sys.platform == "win32":
+        from server.clipboard_win import Clipboard
+        return Clipboard()
+    from server.clipboard_mac import Clipboard
+    return Clipboard()
