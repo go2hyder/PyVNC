@@ -9,7 +9,8 @@ from pathlib import Path
 from PyQt6.QtCore import QMimeData, QObject, QStandardPaths, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QScrollArea, QToolButton,
+    QApplication, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QScrollArea,
+    QToolButton,
 )
 
 from client.connection import QUALITY_PRESETS, Callbacks, ConnectOptions, RFBClient
@@ -30,6 +31,14 @@ SEND_KEYS = [
 SCALES = [("Fit to window", None), ("100%", 1.0), ("75%", 0.75), ("50%", 0.5)]
 
 
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 class Bridge(QObject):
     """Moves callbacks from the network thread onto the Qt GUI thread."""
     connected = pyqtSignal(str, object)
@@ -41,6 +50,7 @@ class Bridge(QObject):
     security = pyqtSignal(str)
     cert_request = pyqtSignal(object)
     file_status = pyqtSignal(str)
+    file_progress = pyqtSignal(str, str, int, int)
     files_received = pyqtSignal(object)
 
     def callbacks(self) -> Callbacks:
@@ -53,6 +63,7 @@ class Bridge(QObject):
             on_closed=self.closed.emit,
             on_security=self.security.emit,
             on_file_status=self.file_status.emit,
+            on_file_progress=self.file_progress.emit,
             on_files=self.files_received.emit,
             confirm_certificate=self._confirm_certificate,
         )
@@ -101,7 +112,14 @@ class ViewerWindow(QMainWindow):
 
         self._build_toolbar()
         self.status = QLabel()
-        self.statusBar().addWidget(self.status)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setFixedWidth(160)
+        self.progress.setFixedHeight(16)
+        self.progress.setTextVisible(True)
+        self.progress.hide()
+        self.statusBar().addWidget(self.status, 1)
+        self.statusBar().addPermanentWidget(self.progress)
         QGuiApplication.clipboard().dataChanged.connect(self._on_local_clipboard)
 
         self.resize(1024, 700)
@@ -113,6 +131,9 @@ class ViewerWindow(QMainWindow):
         self.setWindowTitle(f"{self.conn.display_name} - connecting...")
         self._security = ""
         self._was_connected = False
+        self._transfer_note = ""
+        self.progress.hide()
+        self.progress.setValue(0)
         self.status.setText(f"Connecting to {self.conn.host}:{self.conn.port}...")
         options = ConnectOptions(
             host=self.conn.host, port=self.conn.port, password=self.password,
@@ -134,6 +155,7 @@ class ViewerWindow(QMainWindow):
         b.security.connect(self._on_security)
         b.cert_request.connect(self._on_cert_request)
         b.file_status.connect(self._on_file_status)
+        b.file_progress.connect(self._on_file_progress)
         b.files_received.connect(self._on_remote_files)
         self.client.start()
 
@@ -294,6 +316,15 @@ class ViewerWindow(QMainWindow):
 
     def _on_file_status(self, text: str) -> None:
         self._transfer_note = text
+        self.progress.hide()
+        self._update_status()
+
+    def _on_file_progress(self, phase: str, name: str, done: int, total: int) -> None:
+        percent = 100 if total <= 0 else min(100, int(done * 100 / total))
+        self.progress.setValue(percent)
+        self.progress.show()
+        verb = "Sending" if phase == "send" else "Receiving"
+        self._transfer_note = f"{verb} {name}   {_format_size(done)} / {_format_size(total)}"
         self._update_status()
 
     def _on_remote_files(self, paths: list[str]) -> None:

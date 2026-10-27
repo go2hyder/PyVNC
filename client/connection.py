@@ -59,6 +59,7 @@ class Callbacks:
     confirm_certificate: Callable[[str, str, str | None], bool] = lambda hp, fp, old: False
     on_security: Callable[[str], None] = lambda description: None
     on_file_status: Callable[[str], None] = lambda text: None
+    on_file_progress: Callable[[str, str, int, int], None] = lambda phase, name, done, total: None
     on_files: Callable[[list[str]], None] = lambda paths: None
 
 
@@ -83,6 +84,10 @@ class RFBClient:
         self._discard_file = False
         self._peer_files = False
         self._send_reject: str | None = None
+        self._receive_label = ""
+        self._progress_key: tuple[str, str] | None = None
+        self._progress_percent = -1
+        self._progress_at = 0.0
 
     # -- thread management -------------------------------------------------
 
@@ -363,6 +368,7 @@ class RFBClient:
                     self._send, rfb.MSG_CLIENT_FILES, paths,
                     reject=lambda: self._send_reject,
                     on_status=self.cb.on_file_status,
+                    on_progress=lambda name, done, total: self._report_progress("send", name, done, total),
                 )
             except asyncio.CancelledError:
                 raise
@@ -389,7 +395,8 @@ class RFBClient:
             if error:
                 self.cb.on_file_status(error)
             else:
-                self.cb.on_file_status(f"Receiving {body['name']}")
+                self._receive_label = body["name"]
+                self._report_progress("receive", self._receive_label, 0, body["size"])
             return
         if op == rfb.FILE_DATA:
             if self._discard_file:
@@ -398,6 +405,9 @@ class RFBClient:
             if error:
                 self._discard_file = True
                 self.cb.on_file_status(error)
+            else:
+                got, total = self._incoming.received
+                self._report_progress("receive", self._receive_label, got, total)
             return
         if op == rfb.FILE_END:
             if self._discard_file:
@@ -425,6 +435,21 @@ class RFBClient:
                 self._send_reject = body["reason"] or "File paste was refused"
             return
         raise ConnectError(f"Bad file operation {op}")
+
+    def _report_progress(self, phase: str, name: str, done: int, total: int) -> None:
+        percent = 100 if total <= 0 else min(100, done * 100 // total)
+        now = time.monotonic()
+        key = (phase, name)
+        if (
+            key != self._progress_key
+            or percent != self._progress_percent
+            or done in (0, total)
+            or now - self._progress_at >= 0.1
+        ):
+            self._progress_key = key
+            self._progress_percent = percent
+            self._progress_at = now
+            self.cb.on_file_progress(phase, name, done, total)
 
     # -- decoding ----------------------------------------------------------
 

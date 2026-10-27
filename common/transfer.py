@@ -114,6 +114,10 @@ class IncomingFile:
         self._size = 0
         self._got = 0
 
+    @property
+    def received(self) -> tuple[int, int]:
+        return self._got, self._size
+
     def begin(self, name: str, size: int) -> str | None:
         self.abort()
         if size < 0 or size > rfb.FILE_MAX_BYTES:
@@ -167,22 +171,26 @@ async def transmit_files(
     paths: list[str],
     reject: Callable[[], str | None],
     on_status: Callable[[str], None] | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> None:
     """Send regular files one at a time. A reject callback stops the rest of the batch."""
     loop = asyncio.get_running_loop()
+    files = [Path(raw) for raw in paths if Path(raw).is_file()]
 
     def status(text: str) -> None:
         if on_status is not None:
             on_status(text)
 
-    for raw in paths:
+    def progress(name: str, done: int, total: int) -> None:
+        if on_progress is not None:
+            on_progress(name, done, total)
+
+    sent: list[str] = []
+    for index, path in enumerate(files, start=1):
         reason = reject()
         if reason:
             status(reason)
             return
-        path = Path(raw)
-        if not path.is_file():
-            continue
         try:
             size = path.stat().st_size
         except OSError as exc:
@@ -191,7 +199,8 @@ async def transmit_files(
         if size > rfb.FILE_MAX_BYTES:
             status(f"Skipped {path.name}: larger than 128 MB")
             continue
-        status(f"Sending {path.name}")
+        label = path.name if len(files) == 1 else f"{path.name} ({index} of {len(files)})"
+        progress(label, 0, size)
         await send(pack_file_begin(msg_type, path.name, size))
         offset = 0
         failed = False
@@ -208,8 +217,13 @@ async def transmit_files(
                 break
             await send(pack_file_data(msg_type, chunk))
             offset += len(chunk)
+            progress(label, offset, size)
         if not failed:
             await send(pack_file_end(msg_type))
+            progress(label, size, size)
+            sent.append(path.name)
+    if sent:
+        status(f"Sent {sent[0]}" if len(sent) == 1 else f"Sent {len(sent)} files")
     reason = reject()
     if reason:
         status(reason)
