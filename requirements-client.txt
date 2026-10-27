@@ -1,0 +1,5 @@
+PyQt6>=6.5
+pycryptodome>=3.20
+Pillow>=10.0
+numpy>=1.26
+keyring>=24
